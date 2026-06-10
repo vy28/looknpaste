@@ -14,8 +14,23 @@ final class ClipboardManager {
         pasteboard.setString(text, forType: .string)
     }
 
+    func copyImage(_ cgImage: CGImage) {
+        let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+        pasteboard.clearContents()
+        pasteboard.writeObjects([image])
+    }
+
     func currentString() -> String? {
         pasteboard.string(forType: .string)
+    }
+
+    /// The clipboard contents as an http(s) URL, if they parse as one.
+    func currentURL() -> URL? {
+        guard let string = currentString()?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let url = URL(string: string),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else { return nil }
+        return url
     }
 
     /// Simulate ⌘V at the current keyboard-focus location.

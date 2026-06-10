@@ -35,20 +35,25 @@ final class OnboardingWindow {
         title.frame = NSRect(x: 24, y: 244, width: 412, height: 28)
         title.autoresizingMask = [.width, .minYMargin]
 
+        let trigger = HotkeySettings.trigger.displayName
         let body = NSTextField(wrappingLabelWithString: """
-        QuickCopy reads the text under your mouse cursor and pastes on demand. \
-        macOS requires Accessibility permission for an app to read other apps' \
-        content and to send keystrokes.
+        QuickCopy reads whatever is under your mouse cursor and pastes on \
+        demand. macOS requires Accessibility permission for an app to read \
+        other apps' content and to send keystrokes. Copying images additionally \
+        needs Screen Recording permission, requested the first time you hover \
+        an image.
 
         Click the button below to open System Settings, then enable QuickCopy \
         in Privacy & Security → Accessibility. QuickCopy detects the change \
         automatically — no relaunch needed.
 
-        Hotkey: ⌥⌘C copies the word under the cursor. Tap it twice quickly to \
-        paste at the keyboard-focused location.
+        Trigger key: \(trigger). Tap it over text/a link/an image to copy; tap \
+        it over a text field to paste there — no click needed. Long-press to \
+        copy a link's text instead of its URL. Change the trigger key any time \
+        from the menu bar item.
         """)
         body.font = .systemFont(ofSize: 13)
-        body.frame = NSRect(x: 24, y: 84, width: 412, height: 150)
+        body.frame = NSRect(x: 24, y: 64, width: 412, height: 170)
         body.autoresizingMask = [.width, .height]
 
         let openButton = NSButton(

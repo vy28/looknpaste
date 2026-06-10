@@ -1,30 +1,38 @@
 import Cocoa
 import CoreGraphics
 
-/// Listens for the global ⌥⌘C hotkey via a `CGEventTap`, distinguishing a
-/// single press (copy) from a double-tap within 400ms (paste).
+/// Recognizes a lone tap of the configured trigger modifier (default Option)
+/// via a `CGEventTap`, distinguishing a short tap from a long press.
 ///
-/// - A single press fires `onCopy` immediately, with no artificial delay.
-/// - A second press within `doubleTapInterval` fires `onPaste` *instead of*
-///   copying again, so paste uses the clipboard captured by the first tap
-///   rather than whatever sits under the cursor at the paste target.
+/// The trigger key is *observed, never consumed*, so it keeps working normally
+/// for typing and shortcuts. A gesture only fires when the trigger is pressed
+/// and released cleanly — if any other key, mouse click, scroll, or extra
+/// modifier happens while it is held, the gesture is cancelled. This keeps
+/// Option+click, Option+letter (special characters), ⌘⌥-combos, etc. working
+/// untouched.
+///
+/// - A short tap (released before `longPressThreshold`) fires `onShortTap`.
+/// - Holding past `longPressThreshold` fires `onLongPress` immediately (so the
+///   user gets feedback and can release), and the subsequent release does not
+///   also fire a short tap.
 final class HotkeyManager {
 
-    var onCopy: (() -> Void)?
-    var onPaste: (() -> Void)?
+    var onShortTap: (() -> Void)?
+    var onLongPress: (() -> Void)?
 
     /// When false, the tap stays installed (so the OS keeps trusting it) but
-    /// hotkey presses are ignored.
+    /// gestures are ignored.
     var isEnabled = true
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
 
-    private var lastPressTime: TimeInterval = 0
-    private let doubleTapInterval: TimeInterval = 0.4
+    private let longPressThreshold: TimeInterval = 0.35
 
-    /// 'c' on a US keyboard.
-    private let keyCodeC: CGKeyCode = 8
+    private var triggerWasDown = false
+    private var gestureActive = false
+    private var longFired = false
+    private var longPressWork: DispatchWorkItem?
 
     // MARK: Lifecycle
 
@@ -32,7 +40,14 @@ final class HotkeyManager {
     func start() -> Bool {
         guard eventTap == nil else { return true }
 
-        let mask = CGEventMask(1 << CGEventType.keyDown.rawValue)
+        let eventTypes: [CGEventType] = [
+            .keyDown, .flagsChanged,
+            .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel,
+        ]
+        var mask: CGEventMask = 0
+        for type in eventTypes {
+            mask |= CGEventMask(1) << CGEventMask(type.rawValue)
+        }
 
         // The tap callback is a C function pointer and cannot capture context,
         // so `self` is threaded through via the refcon pointer.
@@ -72,13 +87,14 @@ final class HotkeyManager {
         }
         runLoopSource = nil
         eventTap = nil
+        cancelGesture()
     }
 
     // MARK: Event handling
 
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         // If the system disables the tap (timeout or user input), re-enable it
-        // so the hotkey keeps working without a relaunch.
+        // so the trigger keeps working without a relaunch.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap = eventTap {
                 CGEvent.tapEnable(tap: tap, enable: true)
@@ -86,38 +102,70 @@ final class HotkeyManager {
             return Unmanaged.passUnretained(event)
         }
 
-        guard type == .keyDown, isEnabled else {
-            return Unmanaged.passUnretained(event)
+        guard isEnabled else { return Unmanaged.passUnretained(event) }
+
+        let triggerFlag = HotkeySettings.trigger.flag
+        let allModifiers: CGEventFlags = [.maskCommand, .maskAlternate, .maskControl, .maskShift]
+        let otherModifiers = event.flags.intersection(allModifiers).subtracting(triggerFlag)
+
+        switch type {
+        case .flagsChanged:
+            let triggerNow = event.flags.contains(triggerFlag)
+            if triggerNow && !triggerWasDown {
+                // Trigger just went down. Only begin a gesture if it is the
+                // sole modifier — a combo (e.g. ⌘⌥) is not a trigger tap.
+                if otherModifiers.isEmpty {
+                    beginGesture()
+                }
+            } else if !triggerNow && triggerWasDown {
+                endGesture()
+            } else if triggerNow && triggerWasDown {
+                // Still held but another modifier toggled → it's a combo now.
+                cancelGesture()
+            }
+            triggerWasDown = triggerNow
+
+        case .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel:
+            // Any other input while the trigger is held means the user is doing
+            // something else (Option+click, typing a special character, etc.).
+            if gestureActive { cancelGesture() }
+
+        default:
+            break
         }
 
-        let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-        let flags = event.flags
-        let isExactlyCommandOption =
-            flags.contains(.maskCommand) &&
-            flags.contains(.maskAlternate) &&
-            !flags.contains(.maskControl) &&
-            !flags.contains(.maskShift)
-
-        guard keyCode == keyCodeC, isExactlyCommandOption else {
-            return Unmanaged.passUnretained(event)
-        }
-
-        dispatch()
-        // Consume the event so ⌥⌘C does not also reach the focused app.
-        return nil
+        // Never consume the event: the trigger key must keep working normally.
+        return Unmanaged.passUnretained(event)
     }
 
-    private func dispatch() {
-        let now = ProcessInfo.processInfo.systemUptime
-        let isDoubleTap = (now - lastPressTime) <= doubleTapInterval
+    // MARK: Gesture state machine
 
-        if isDoubleTap {
-            // Reset so a third rapid press starts a fresh single-press cycle.
-            lastPressTime = 0
-            DispatchQueue.main.async { [weak self] in self?.onPaste?() }
-        } else {
-            lastPressTime = now
-            DispatchQueue.main.async { [weak self] in self?.onCopy?() }
+    private func beginGesture() {
+        gestureActive = true
+        longFired = false
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.gestureActive else { return }
+            self.longFired = true
+            self.onLongPress?()
         }
+        longPressWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + longPressThreshold, execute: work)
+    }
+
+    private func endGesture() {
+        longPressWork?.cancel()
+        longPressWork = nil
+        let shouldFireShort = gestureActive && !longFired
+        gestureActive = false
+        if shouldFireShort {
+            DispatchQueue.main.async { [weak self] in self?.onShortTap?() }
+        }
+    }
+
+    private func cancelGesture() {
+        longPressWork?.cancel()
+        longPressWork = nil
+        gestureActive = false
     }
 }
